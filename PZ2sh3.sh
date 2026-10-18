@@ -102,5 +102,4 @@ else
   echo "WordPress ещё не установлен (нет wp-config.php), пропускаю."
 fi
 echo "ГОТОВО. Открывайте https://$DOMAIN"
-EOF_S3
-bash /root/pz2_stage3.sh
+
