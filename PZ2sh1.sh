@@ -56,5 +56,4 @@ ip r
 ping -c2 192.168.25.252 || echo "!!! Router недоступен"
 ping -c2 8.8.8.8        || echo "!!! Нет выхода в интернет через Router"
 ping -c2 ubuntu.com     || echo "!!! DNS не работает"
-EOF_S1
-bash /root/pz2_stage1.sh
+
