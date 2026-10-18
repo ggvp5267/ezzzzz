@@ -1,0 +1,554 @@
+# ПЗ2: Nginx + WordPress + SSL (фамилия `gg`, шифр `005`)
+
+Я взял **третью цифру шифра = 5**. Это значит, что в таблице 1.10 ваша строка такая:
+
+| Параметр | Значение |
+|---|---|
+| Сеть | 192.168.25.0/24 |
+| Router | 192.168.25.252 |
+| Server (задание п. 1.6) | **192.168.25.250**, шлюз 192.168.25.252 |
+| Hostname | `ggServer` |
+| Пользователь ОС | `gg` / пароль `gg` |
+| БД | `wordpress`, пользователь `gg`, пароль `gg`; root MySQL: `ubuntu` (как в методичке) |
+| Домен для сертификата | `gg.bsuir.lab` (содержит фамилию) |
+
+**Порядок работы:** ручной блок A, скрипт 1, ручной блок B, скрипт 2, ручной блок C (WordPress и картинки), скрипт 3 (SSL), ручной блок D (проверка HTTPS и Wireshark), затем диагностика.
+
+---
+
+## Ручной блок A: VirtualBox (до всяких скриптов)
+
+1. Запустите **«gg Router»** (из ПЗ1). Он должен работать всё время, иначе у сервера не будет интернета.
+2. Выключите «HTTP-server» и нажмите на нём правой кнопкой → **Clone** (Ctrl+O).
+   - Name: `gg server`.
+   - MAC Address Policy: **Generate new MAC addresses for all network adapters**.
+   - Тип клона: Full clone → Clone.
+3. Выберите `gg server` → **Settings → Network → Adapter 1**:
+   - Enable Network Adapter: включено.
+   - Attached to: **NAT Network**.
+   - Name: **NatNetwork_gg** (та же сеть, что в ПЗ1).
+4. Проверьте сеть: **Tools → Network → вкладка NAT Networks** (в старых версиях File → Tools → Network Manager) → `NatNetwork_gg`:
+   - IPv4 prefix: `192.168.25.0/24`.
+   - **Enable DHCP: выключено** (так требует ПЗ1, DHCP теперь на роутере).
+5. Запустите `gg server` и войдите под учёткой, которая есть в образе HTTP-server.
+6. Если вставка в консоль VirtualBox не работает, включите **Devices → Shared Clipboard → Bidirectional** (нужны Guest Additions). Запасной вариант: подключаться по SSH с хоста, предварительно добавив проброс порта (блок B).
+
+Дальше все скрипты запускаются от root:
+```bash
+sudo -i
+```
+
+---
+
+## Скрипт 1: hostname, пользователь, статический IP, шлюз, DNS
+
+Вставьте в терминал целиком. Скрипт сохранится в файл и сразу запустится.
+
+```bash
+cat > /root/pz2_stage1.sh <<'EOF_S1'
+#!/bin/bash
+set -e
+HOST_NEW="ggServer"
+USER_NEW="gg"
+IP="192.168.25.250"
+PREFIX="24"
+GW="192.168.25.252"
+DNS="185.11.79.5, 8.8.8.8"
+IFACE=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
+echo ">>> Сетевой интерфейс: $IFACE"
+
+# --- hostname ---
+hostnamectl set-hostname "$HOST_NEW"
+grep -q "$HOST_NEW" /etc/hosts || echo "127.0.1.1 $HOST_NEW" >> /etc/hosts
+
+# --- пользователь с правами администратора ---
+id "$USER_NEW" >/dev/null 2>&1 || useradd -m -s /bin/bash "$USER_NEW"
+echo "${USER_NEW}:${USER_NEW}" | chpasswd
+usermod -aG sudo "$USER_NEW"
+
+# --- netplan: статический IP ---
+cat > /etc/netplan/99-lan-interface.yaml <<EOF
+network:
+  version: 2
+  ethernets:
+    ${IFACE}:
+      dhcp4: false
+      addresses: [${IP}/${PREFIX}]
+      routes:
+        - to: default
+          via: ${GW}
+      nameservers:
+        addresses: [${DNS}]
+EOF
+chmod 600 /etc/netplan/99-lan-interface.yaml
+
+# остальные netplan-файлы убираем в бэкап, чтобы они не конфликтовали
+mkdir -p /root/netplan-backup
+for f in /etc/netplan/*.yaml; do
+  [ "$f" = "/etc/netplan/99-lan-interface.yaml" ] || mv "$f" /root/netplan-backup/
+done
+# запрет cloud-init перегенерировать сеть
+if [ -d /etc/cloud/cloud.cfg.d ]; then
+  echo "network: {config: disabled}" > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+fi
+
+netplan generate
+netplan apply
+sleep 5
+
+echo "=== ПРОВЕРКА ==="
+hostnamectl | grep -i "static hostname"
+ip -br a
+ip r
+ping -c2 192.168.25.252 || echo "!!! Router недоступен"
+ping -c2 8.8.8.8        || echo "!!! Нет выхода в интернет через Router"
+ping -c2 ubuntu.com     || echo "!!! DNS не работает"
+EOF_S1
+bash /root/pz2_stage1.sh
+```
+
+Если все три `ping` прошли, переходите дальше. Если нет, проверьте, что «gg Router» запущен, у него работает NAT и включён `ip_forward` (ПЗ1).
+
+---
+
+## Ручной блок B: доступ к серверу с вашего компьютера
+
+Ваш сервер находится в NatNetwork, и с хоста Windows его напрямую не видно. В методичке на рисунках 2.7 и 2.10 это решено адресом `127.0.0.16`, то есть пробросом портов. Сделайте так же.
+
+**1. Проброс портов.** Откройте Tools → Network → NAT Networks → `NatNetwork_gg` → Edit → **Port Forwarding** (IPv4) и добавьте 3 правила:
+
+| Name | Protocol | Host IP | Host Port | Guest IP | Guest Port |
+|---|---|---|---|---|---|
+| http | TCP | 127.0.0.25 | 80 | 192.168.25.250 | 80 |
+| https | TCP | 127.0.0.25 | 443 | 192.168.25.250 | 443 |
+| ssh-server | TCP | 127.0.0.25 | 2225 | 192.168.25.250 | 22 |
+
+После этого можно подключаться по SSH с хоста: `ssh gg@127.0.0.25 -p 2225`. Так удобнее вставлять скрипты.
+
+**2. Запись в hosts (на Windows-хосте).**
+- Запустите Блокнот **от имени администратора**.
+- Откройте `C:\Windows\System32\drivers\etc\hosts` (в диалоге выберите «Все файлы»).
+- Добавьте строку в конец и сохраните:
+```
+127.0.0.25   gg.bsuir.lab
+```
+
+Если вы вместо этого работаете из ВМ Windows 10 внутри NatNetwork_gg, пропишите в её hosts `192.168.25.250 gg.bsuir.lab` и открывайте сайт по этому адресу.
+
+---
+
+## Скрипт 2: MySQL, PHP, Nginx (HTTP), WordPress
+
+```bash
+cat > /root/pz2_stage2.sh <<'EOF_S2'
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+DB_NAME="wordpress"; DB_USER="gg"; DB_PASS="gg"; MYSQL_ROOT_PASS="ubuntu"
+DOMAIN="gg.bsuir.lab"
+
+echo "=== [1/6] Nginx ==="
+apt-get update
+apt-get install -y nginx wget unzip curl
+systemctl enable nginx
+systemctl start nginx
+
+echo "=== [2/6] MySQL ==="
+apt-get install -y mysql-server mysql-client
+systemctl enable mysql
+systemctl start mysql
+if mysql -uroot -e "SELECT 1" >/dev/null 2>&1; then MYSQL_CMD="mysql -uroot"; else MYSQL_CMD="mysql -uroot -p${MYSQL_ROOT_PASS}"; fi
+$MYSQL_CMD <<SQL
+CREATE DATABASE IF NOT EXISTS ${DB_NAME} DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON ${DB_NAME}.* TO '${DB_USER}'@'localhost';
+ALTER USER 'root'@'localhost' IDENTIFIED WITH caching_sha2_password BY '${MYSQL_ROOT_PASS}';
+FLUSH PRIVILEGES;
+SQL
+
+echo "=== [3/6] PHP ==="
+# сначала php-fpm, чтобы apt не потянул apache2
+apt-get install -y php-fpm php-cli php-gd php-mysql php-zip php-xml php-mbstring php-curl php-intl
+apt-get install -y php
+systemctl disable --now apache2 2>/dev/null || true
+PHPV=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+echo "Версия PHP: $PHPV"
+cat > /etc/php/${PHPV}/fpm/conf.d/99-wp-upload.ini <<EOF
+upload_max_filesize = 64M
+post_max_size = 64M
+memory_limit = 256M
+EOF
+systemctl enable php${PHPV}-fpm
+systemctl restart php${PHPV}-fpm
+
+echo "=== [4/6] WordPress ==="
+cd /tmp
+rm -rf wordpress latest.zip
+wget -q https://wordpress.org/latest.zip
+unzip -q latest.zip
+rm -f /var/www/html/index.nginx-debian.html
+cp -r wordpress/* /var/www/html/
+chown -R www-data:www-data /var/www/html/
+
+echo "=== [5/6] Конфиг Nginx (HTTP) ==="
+cat > /etc/nginx/sites-available/default <<'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    root /var/www/html;
+    index index.php index.html index.htm;
+    server_name __DOMAIN__ _;
+    client_max_body_size 64M;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # pass PHP scripts to FastCGI server
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php__PHPV__-fpm.sock;
+    }
+
+    # deny access to .htaccess files
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+sed -i "s/__DOMAIN__/$DOMAIN/g; s/__PHPV__/$PHPV/g" /etc/nginx/sites-available/default
+ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
+nginx -t
+systemctl restart nginx
+
+echo "=== [6/6] СТАТУСЫ (для отчёта) ==="
+systemctl status nginx --no-pager | head -n 8
+systemctl status mysql --no-pager | head -n 8
+systemctl status php${PHPV}-fpm --no-pager | head -n 8
+curl -sI http://localhost | head -n 5
+echo "ГОТОВО. Теперь откройте в браузере хоста http://127.0.0.25"
+EOF_S2
+bash /root/pz2_stage2.sh
+```
+
+Скрипт отличается от методички в двух местах:
+- В `try_files` стоит `/index.php?$args`, а не `=404`. Иначе у WordPress ломаются красивые ссылки.
+- Установлены дополнительные PHP-модули (`xml`, `mbstring`, `curl`, `intl`), которые нужны WordPress.
+
+---
+
+## Ручной блок C: установка WordPress, страница с резюме, картинки
+
+### C1. Установка WordPress (рис. 2.5–2.6 методички)
+
+1. В браузере хоста откройте **http://127.0.0.25**. Появится мастер установки WordPress.
+2. Выберите язык (English или Русский) → Continue → **Let's go!**
+3. Форма подключения к базе (рис. 2.6):
+
+| Поле | Значение |
+|---|---|
+| Database Name | `wordpress` |
+| Username | `gg` |
+| Password | `gg` |
+| Database Host | `localhost` |
+| Table Prefix | `wp_` |
+
+4. Нажмите Submit → **Run the installation**.
+5. Форма сайта:
+   - Site Title: `gg`.
+   - Username: `gg`.
+   - Password: `gg`. WordPress предупредит о слабом пароле, отметьте **Confirm use of weak password**.
+   - Your Email: `gg@mail.bu`.
+6. Нажмите **Install WordPress**, затем Log In и войдите как `gg` / `gg`.
+
+Сделайте скриншоты для отчёта: форму БД, страницу входа и админку.
+
+### C2. Страница с резюме
+
+1. В админке откройте **Pages → Add New** (в русской версии «Страницы → Добавить»).
+2. Заголовок: `Резюме — gg`.
+3. Нажмите «+» и добавьте блоки в таком порядке:
+   - **Image** или **Cover**: баннер (см. C3).
+   - **Heading**: `gg`.
+   - **Paragraph**: о себе, например «Студент 3 курса БГУИР, факультет информационной безопасности, группа ______».
+   - **Heading** «Образование» и **List**: БГУИР, ФИБ, кафедра защиты информации.
+   - **Heading** «Навыки» и **List**: Linux, сети, Nginx, iptables, Wireshark и т. п.
+   - **Heading** «Контакты» и **Paragraph**: gg@mail.bu.
+4. Нажмите **Publish**.
+5. Сделайте её главной страницей: **Settings → Reading → Your homepage displays → A static page → Homepage: «Резюме — gg» → Save Changes**.
+
+### C3. Картинки: где взять и как подписать
+
+**Какие нужны (достаточно 2):**
+- **Баннер** в шапку на тему защиты информации. Поисковые запросы: `cyber security`, `server room`, `programmer desk`, `network cables`.
+- **Ваше фото** (аватар). Если не хотите свою фотографию, возьмите нейтральный портрет-заглушку.
+
+**Откуда скачать (бесплатные лицензии):**
+- https://unsplash.com
+- https://www.pexels.com
+- https://pixabay.com
+
+Скачивайте на хосте, размер Medium или Large (ширина 1200–1920 px, менее 2 МБ). Переименуйте файлы латиницей без пробелов: `gg-banner.jpg`, `gg-photo.jpg`. Не берите картинки из Google с неясной лицензией.
+
+**Как загрузить и подписать:**
+1. Админка → **Media → Add New** → перетащите файлы.
+2. Откройте картинку (Media → Library → клик по файлу) и заполните поля справа:
+
+| Поле | Что писать | Пример |
+|---|---|---|
+| **Alt Text** | краткое описание для скринридеров | `Баннер: информационная безопасность` |
+| **Title** | заголовок файла | `gg banner` |
+| **Caption** | видимая подпись под картинкой | `Фото: Имя автора / Unsplash` |
+| **Description** | произвольно | `Баннер для страницы резюме` |
+
+3. Вставьте картинку в страницу: блок **Image** → **Media Library** → выберите файл → Insert. Подпись можно ещё поправить прямо под картинкой («Add caption»). Нажмите **Update**.
+4. Если «подписать» значит «надписать поверх картинки», используйте блок **Cover**: выберите картинку как фон и напишите поверх `gg — Information Security`.
+
+Картинка обязательно должна быть **вставлена в страницу**, а не только лежать в медиатеке. Проверьте, что она отображается на главной.
+
+### C4. Проверка HTTP (п. 2.3 задания)
+
+Скриншоты: главная страница в браузере по `http://127.0.0.25` (в адресной строке видно «Не защищено»). В терминале сервера выполните:
+```bash
+curl -I http://localhost
+```
+
+---
+
+## Скрипт 3: SSL-сертификат (2 года, 2048 бит), TLSv1.3, HTTP/2, редирект 80→443
+
+`dhparam 4096` на виртуалке считается **долго, от 5 до 30 минут**. Не прерывайте его.
+
+```bash
+cat > /root/pz2_stage3.sh <<'EOF_S3'
+#!/bin/bash
+set -e
+DOMAIN="gg.bsuir.lab"
+SERVER_IP="192.168.25.250"
+DAYS=730          # 2 года
+DH_BITS=4096
+PHPV=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+
+echo "=== [1/5] Ключ и самоподписанный сертификат ==="
+openssl req -x509 -nodes -days $DAYS -newkey rsa:2048 \
+  -keyout /etc/ssl/private/nginx-selfsigned.key \
+  -out /etc/ssl/certs/nginx-selfsigned.crt \
+  -subj "/C=BY/ST=Minsk/L=Minsk/O=BSUIR/OU=IS/CN=${DOMAIN}/emailAddress=gg@mail.bu" \
+  -addext "subjectAltName=DNS:${DOMAIN},IP:${SERVER_IP}"
+chmod 600 /etc/ssl/private/nginx-selfsigned.key
+
+echo "=== [2/5] Параметры Диффи-Хеллмана (долго!) ==="
+[ -f /etc/nginx/dhparam.pem ] || openssl dhparam -out /etc/nginx/dhparam.pem $DH_BITS
+
+echo "=== [3/5] Сниппеты ==="
+mkdir -p /etc/nginx/snippets
+cat > /etc/nginx/snippets/self-signed.conf <<'EOF'
+ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+EOF
+
+cat > /etc/nginx/snippets/ssl-params.conf <<'EOF'
+ssl_protocols TLSv1.3;
+ssl_prefer_server_ciphers on;
+ssl_dhparam /etc/nginx/dhparam.pem;
+ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
+ssl_ecdh_curve secp384r1;
+ssl_session_timeout 10m;
+ssl_session_cache shared:SSL:10m;
+ssl_session_tickets off;
+ssl_stapling on;
+ssl_stapling_verify on;
+resolver 185.11.79.5 8.8.8.8 valid=300s;
+resolver_timeout 5s;
+# Disable strict transport security for now.
+#add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload";
+add_header X-Frame-Options SAMEORIGIN;
+add_header X-Content-Type-Options nosniff;
+add_header X-XSS-Protection "1; mode=block";
+EOF
+
+echo "=== [4/5] Конфиг сервера ==="
+cat > /etc/nginx/sites-available/default <<'EOF'
+server {
+    #LISTEN#
+    include snippets/self-signed.conf;
+    include snippets/ssl-params.conf;
+
+    server_name __DOMAIN__ _;
+    root /var/www/html;
+    index index.php index.html index.htm;
+    client_max_body_size 64M;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php__PHPV__-fpm.sock;
+    }
+    location ~ /\.ht {
+        deny all;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name __DOMAIN__ _;
+    return 302 https://$host$request_uri;
+}
+EOF
+NGV=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+if [ "$(printf '%s\n%s\n' 1.25.1 "$NGV" | sort -V | head -1)" = "1.25.1" ]; then
+  L='listen 443 ssl default_server;\n    listen [::]:443 ssl default_server;\n    http2 on;'
+else
+  L='listen 443 ssl http2 default_server;\n    listen [::]:443 ssl http2 default_server;'
+fi
+sed -i "s|#LISTEN#|$L|; s/__DOMAIN__/$DOMAIN/g; s/__PHPV__/$PHPV/g" /etc/nginx/sites-available/default
+nginx -t
+systemctl restart nginx
+
+echo "=== [5/5] Перевод WordPress на https://$DOMAIN ==="
+if [ -f /var/www/html/wp-config.php ]; then
+  curl -sSL -o /usr/local/bin/wp https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+  chmod +x /usr/local/bin/wp
+  NEW="https://${DOMAIN}"
+  OLD=$(wp --allow-root --path=/var/www/html option get siteurl 2>/dev/null || true)
+  echo "Старый URL: $OLD -> новый: $NEW"
+  if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+    wp --allow-root --path=/var/www/html search-replace "$OLD" "$NEW" --all-tables --skip-columns=guid
+    wp --allow-root --path=/var/www/html search-replace "${OLD//\//\\/}" "${NEW//\//\\/}" --all-tables --skip-columns=guid || true
+  fi
+  chown -R www-data:www-data /var/www/html
+else
+  echo "WordPress ещё не установлен (нет wp-config.php), пропускаю."
+fi
+echo "ГОТОВО. Открывайте https://$DOMAIN"
+EOF_S3
+bash /root/pz2_stage3.sh
+```
+
+В выводе появится предупреждение `ssl_stapling ignored, no OCSP responder URL`. Это нормально для самоподписанного сертификата.
+
+Скрипт сам заменяет адрес сайта в WordPress на `https://gg.bsuir.lab` (иначе будет цикл редиректов или картинки не загрузятся из-за mixed content).
+
+Два отличия от методички, о которых вас могут спросить:
+- Редирект в методичке `return 302 https://$server_name...` при `server_name _` отправляет на адрес `https://_/`. Поэтому я использую `$host`.
+- Заголовок `X-Frame-Options` я поставил `SAMEORIGIN` вместо `DENY`. С `DENY` не работает предпросмотр в админке WordPress.
+
+**После проверки замените 302 на 301** (требование методички):
+```bash
+sed -i 's/return 302/return 301/' /etc/nginx/sites-available/default && nginx -t && systemctl reload nginx
+```
+
+---
+
+## Ручной блок D: проверка HTTPS, сертификат, Wireshark
+
+1. Откройте **https://gg.bsuir.lab** (по hosts он ведёт на 127.0.0.25). Браузер покажет предупреждение о сертификате (рис. 2.9). Это ожидаемо: нажмите «Дополнительно → Продолжить».
+2. **Просмотр сертификата** (рис. 2.10): в Chrome нажмите на значок «Не защищено» слева от адреса → «Недействительный сертификат»; в Firefox: замок → «Подробнее» → «Просмотреть сертификат». На скриншоте должны быть CN `gg.bsuir.lab`, организация BSUIR и срок 2 года.
+3. **Импорт сертификата**, чтобы убрать предупреждение:
+   - Скопируйте сертификат с сервера: `scp -P 2225 gg@127.0.0.25:/etc/ssl/certs/nginx-selfsigned.crt .` (или откройте файл `cat` и вставьте текст в `gg.crt`).
+   - Дважды кликните по `gg.crt` → Установить сертификат → Локальный компьютер → **Поместить в хранилище: «Доверенные корневые центры сертификации»**.
+   - Перезапустите браузер.
+4. **Wireshark** (рис. 2.11):
+   - Запустите Wireshark, выберите интерфейс **Adapter for loopback traffic capture**.
+   - Фильтр захвата или отображения: `ip.addr == 127.0.0.25`.
+   - Обновите страницу в браузере.
+   - В списке будут `TLSv1.3` (Client Hello, Server Hello, Application Data). Раскройте «Transport Layer Security» и сделайте скриншот.
+   - Для HTTP/2 откройте Client Hello → extension **ALPN**, там `h2`.
+
+---
+
+## Команды диагностики (для отчёта и для вопросов преподавателя)
+
+```bash
+############ 1. Система и сеть ############
+hostnamectl                                  # имя ВМ (ggServer)
+ip -br a                                     # IP 192.168.25.250/24
+ip r                                         # default via 192.168.25.252
+cat /etc/netplan/99-lan-interface.yaml       # конфиг интерфейса
+ping -c2 192.168.25.252; ping -c2 8.8.8.8; ping -c2 ubuntu.com
+id gg                                        # пользователь есть, группа sudo
+
+############ 2. Сервисы активны / включены в автозагрузку ############
+PHPV=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+systemctl status nginx mysql php${PHPV}-fpm --no-pager
+systemctl is-active nginx mysql php${PHPV}-fpm
+systemctl is-enabled nginx mysql php${PHPV}-fpm
+systemctl status apache2 --no-pager          # должен быть inactive/dead
+
+############ 3. Процессы Nginx (рис. 2.2 и 2.3 методички) ############
+ps -efH | grep nginx                         # master от root, worker от www-data
+sudo ss -tlpn                                # слушаются 80, 443, 3306, 22
+sudo ss -4lpn | grep 443
+grep -E '^user|worker_processes' /etc/nginx/nginx.conf
+nproc                                        # число ядер (≈ число воркеров)
+cat /run/nginx.pid                           # PID master-процесса
+nginx -s reload                              # = SIGHUP мастеру: перечитать конфиг без потери соединений
+
+############ 4. Конфигурация Nginx ############
+nginx -v
+nginx -t                                     # syntax is ok / test is successful
+ls -l /etc/nginx/sites-enabled/              # симлинк на sites-available/default
+cat /etc/nginx/sites-available/default
+cat /etc/nginx/snippets/self-signed.conf
+cat /etc/nginx/snippets/ssl-params.conf
+nginx -T | grep -E 'ssl_protocols|http2|ssl_certificate'
+
+############ 5. MySQL ############
+mysql -uroot -pubuntu -e "SHOW DATABASES; SELECT user,host,plugin,authentication_string FROM mysql.user;"
+mysql -ugg -pgg -e "SHOW DATABASES; USE wordpress; SHOW TABLES;"
+mysql -uroot -pubuntu -e "SHOW GRANTS FOR 'gg'@'localhost';"
+
+############ 6. PHP и WordPress ############
+php -v
+php -m | grep -Ei 'mysql|gd|zip'
+ls -l /run/php/                              # сокет php-fpm
+ls /var/www/html                             # файлы WordPress
+stat -c '%U:%G %n' /var/www/html            # www-data:www-data
+curl -I http://localhost                     # 301/302 на https (после SSL)
+curl -skI https://localhost | head -5        # 200 OK
+
+############ 7. Где лежит сертификат и ключ ############
+ls -l /etc/ssl/certs/nginx-selfsigned.crt    # сертификат (публичный)
+ls -l /etc/ssl/private/nginx-selfsigned.key  # закрытый ключ (права 600, root)
+ls -l /etc/nginx/dhparam.pem                 # параметры Диффи-Хеллмана (PFS)
+
+############ 8. Содержимое и срок сертификата ############
+openssl x509 -in /etc/ssl/certs/nginx-selfsigned.crt -noout -subject -issuer -dates -fingerprint -sha256
+openssl x509 -in /etc/ssl/certs/nginx-selfsigned.crt -noout -ext subjectAltName
+openssl x509 -in /etc/ssl/certs/nginx-selfsigned.crt -noout -text | grep -E 'Public-Key|Signature Algorithm'   # RSA 2048
+openssl rsa -in /etc/ssl/private/nginx-selfsigned.key -check -noout                                           # RSA key ok
+# ключ и сертификат — пара (хэши должны совпасть):
+openssl x509 -noout -modulus -in /etc/ssl/certs/nginx-selfsigned.crt | md5sum
+openssl rsa  -noout -modulus -in /etc/ssl/private/nginx-selfsigned.key | md5sum
+
+############ 9. TLS 1.3 и HTTP/2 ############
+curl -vkI --http2 https://localhost 2>&1 | grep -Ei 'TLSv1.3|ALPN|HTTP/2|subject|expire'
+openssl s_client -connect localhost:443 -servername gg.bsuir.lab -tls1_3 </dev/null 2>/dev/null | grep -E 'Protocol|Cipher|subject|issuer'
+openssl s_client -connect localhost:443 -tls1_2 </dev/null 2>&1 | head -5   # должен быть отказ (handshake failure)
+
+############ 10. Логи и файрвол ############
+tail -n 20 /var/log/nginx/access.log
+tail -n 20 /var/log/nginx/error.log
+journalctl -u nginx -n 30 --no-pager
+ufw status; iptables -S                      # на всякий случай: не блокирует ли 80/443
+```
+
+---
+
+## Что приложить к отчёту (чек-лист скриншотов)
+
+1. VirtualBox со списком ВМ (`gg Router`, `gg server`) и настройкой адаптера NatNetwork_gg.
+2. Вывод скрипта 1 (`ip -br a`, `ip r`, ping).
+3. `systemctl status` для nginx, mysql и php-fpm.
+4. Форма БД WordPress, страница входа и готовая страница резюме **с картинкой**.
+5. `curl -I http://localhost` и страница по HTTP.
+6. Сертификат (CN, срок 2 года, RSA 2048) и страница по `https://gg.bsuir.lab`.
+7. Wireshark: TLSv1.3 и ALPN `h2`.
+8. Вывод `ss -tlpn` и `ps -efH | grep nginx`.
+
+Если какой-то скрипт упадёт, пришлите последние 15–20 строк вывода, и я подскажу, что исправить. Все скрипты сохранены в `/root/pz2_stage*.sh`, их можно запускать повторно.
