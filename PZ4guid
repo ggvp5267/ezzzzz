@@ -1,0 +1,504 @@
+# ПЗ4: Alertmanager + Telegram-оповещения + Zeek + DoS-атаки (HTTP/TCP/UDP flood)
+
+Работаем на том же `gg server` (192.168.25.250), где уже стоят Nginx, nginx-exporter и Prometheus (ПЗ2–ПЗ3). Атаки будете запускать с `gg Ubuntu` (атакующая ВМ из ПЗ3).
+
+Порядок: ручной блок A (Telegram-бот) → скрипт 1 (Alertmanager) → ручной блок B (chat_id, проверка) → скрипт 2 (связка с Prometheus + правило HttpFlood) → ручной блок C (демонстрация оповещения) → скрипт 3 (Zeek) → скрипт 4 (правила UDP/TCP flood) → ручной блок D (атаки hping3) → диагностика.
+
+---
+
+## Ручной блок A: создание Telegram-бота и канала
+
+Это нельзя сделать скриптом — выполняется руками в приложении Telegram.
+
+1. Откройте Telegram, найдите **@BotFather**, нажмите Start.
+2. Отправьте команду `/newbot`.
+3. На вопрос **name** (отображаемое имя) введите что-то с вашей фамилией, например: `gg Alerts Bot`.
+4. На вопрос **username** (должен заканчиваться на `bot`) введите, например: `gg_zis_alerts_bot` (если занято — добавьте цифры, напр. `gg_zis_2026_bot`).
+5. BotFather пришлёт сообщение вида:
+   ```
+   Done! Congratulations on your new bot...
+   Use this token to access the HTTP API:
+   8341234567:AAH1xxxxxxxxxxxxxxxxxxxxxxxxxxxxxZA
+   ```
+   **Сохраните токен** — он нужен в `alertmanager.yml`.
+6. Создайте новую **группу** (не канал, а именно группу — так проще получить числовой `chat_id` со знаком минус, как в методичке): **New Group** → назовите, например, `gg AlertMessages` → добавьте в неё вашего бота по username.
+7. В настройках группы (Edit → Administrators) назначьте бота **администратором**.
+8. Отправьте в группу любое сообщение, например `/start`, чтобы у бота появилось событие для `getUpdates`.
+
+---
+
+## Скрипт 1: установка и настройка Alertmanager (на `gg server`)
+
+Перед запуском замените `BOT_TOKEN` на токен из п. 5 выше. `chat_id` пока оставьте как плейсхолдер — его получим в ручном блоке B и впишем позже одной командой.
+
+```bash
+cat > /root/pz4_stage1.sh <<'EOF_S1'
+#!/bin/bash
+set -e
+AM_VER="0.27.0"
+BOT_TOKEN="ВСТАВЬТЕ_ТОКЕН_БОТА_СЮДА"
+
+echo "=== [1/5] Загрузка Alertmanager ==="
+cd /tmp
+rm -rf alertmanager-${AM_VER}.linux-amd64*
+wget -q https://github.com/prometheus/alertmanager/releases/download/v${AM_VER}/alertmanager-${AM_VER}.linux-amd64.tar.gz
+tar xzf alertmanager-${AM_VER}.linux-amd64.tar.gz
+cd alertmanager-${AM_VER}.linux-amd64
+
+echo "=== [2/5] Копирование бинарников ==="
+cp alertmanager amtool /usr/local/bin/
+
+echo "=== [3/5] Конфигурация ==="
+mkdir -p /etc/alertmanager
+cat > /etc/alertmanager/alertmanager.yml <<EOF
+global:
+route:
+  group_by: ['alertname']
+  group_wait: 3s
+  group_interval: 5s
+  repeat_interval: 1h
+  receiver: 'telegram'
+receivers:
+- name: 'telegram'
+  telegram_configs:
+  - bot_token: '${BOT_TOKEN}'
+    api_url: 'https://api.telegram.org'
+    chat_id: -1000000000000
+    parse_mode: 'HTML'
+EOF
+
+echo "=== [4/5] systemd service ==="
+cat > /etc/systemd/system/alertmanager.service <<'EOF'
+[Unit]
+Description=Alertmanager Server Service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=root
+Group=root
+Type=simple
+ExecStart=/usr/local/bin/alertmanager --config.file /etc/alertmanager/alertmanager.yml --web.external-url=http://127.0.0.1:9093
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "=== [5/5] Запуск ==="
+systemctl daemon-reload
+systemctl enable alertmanager
+systemctl start alertmanager
+sleep 2
+systemctl status alertmanager --no-pager | head -n 10
+curl -s http://127.0.0.1:9093/-/healthy
+echo
+echo "Alertmanager поднят, но chat_id пока фиктивный — впишем его в блоке B."
+EOF_S1
+bash /root/pz4_stage1.sh
+```
+
+Добавьте проброс порта для веб-интерфейса Alertmanager (VirtualBox → NAT Networks → `NatNetwork_gg` → Port Forwarding):
+
+| Name | Protocol | Host IP | Host Port | Guest IP | Guest Port |
+|---|---|---|---|---|---|
+| alertmanager | TCP | 127.0.0.25 | 9093 | 192.168.25.250 | 9093 |
+
+Откройте **http://127.0.0.25:9093/#/alerts** — должна открыться пустая страница Alertmanager (рис. 4.5 методички).
+
+---
+
+## Ручной блок B: получение chat_id и его подстановка
+
+1. В браузере (на хосте) откройте:
+   ```
+   https://api.telegram.org/bot<ВАШ_ТОКЕН>/getUpdates
+   ```
+   (вместо `<ВАШ_ТОКЕН>` вставьте полный токен, например `https://api.telegram.org/bot8341234567:AAH1xxx.../getUpdates`).
+2. В JSON-ответе найдите блок `my_chat_member` → `chat` → `id`. Это будет отрицательное число вида `-4512345678`. Это и есть `chat_id` (рис. 4.2 методички).
+   - Если `result` пустой `[]`, значит бот ещё не получил ни одного события — вернитесь в группу, отправьте сообщение ещё раз, добавьте/удалите бота заново и обновите страницу `getUpdates`.
+3. На сервере впишите реальный `chat_id`:
+   ```bash
+   sed -i "s/chat_id: -1000000000000/chat_id: ВАШ_CHAT_ID/" /etc/alertmanager/alertmanager.yml
+   cat /etc/alertmanager/alertmanager.yml
+   systemctl restart alertmanager
+   systemctl status alertmanager --no-pager | head -n 8
+   ```
+4. Проверьте отправку вручную через API (не дожидаясь правил Prometheus):
+   ```bash
+   curl -s -X POST "https://api.telegram.org/bot<ВАШ_ТОКЕН>/sendMessage" \
+     -d chat_id="ВАШ_CHAT_ID" -d text="Тест от gg server"
+   ```
+   В группе Telegram должно появиться сообщение «Тест от gg server». Если появилось — конфигурация верна, переходите дальше.
+
+---
+
+## Скрипт 2: связка Prometheus ↔ Alertmanager + правило HttpFlood
+
+```bash
+cat > /root/pz4_stage2.sh <<'EOF_S2'
+#!/bin/bash
+set -e
+
+echo "=== [1/3] prometheus.yml: добавляем alerting и rule_files ==="
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+  scrape_timeout: 1s
+  external_labels:
+    monitor: 'gg-project'
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']
+rule_files:
+  - alert.rules.yml
+
+scrape_configs:
+  - job_name: "nginx"
+    static_configs:
+      - targets: ["127.0.0.1:9114"]
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+EOF
+chown prometheus:prometheus /etc/prometheus/prometheus.yml
+
+echo "=== [2/3] alert.rules.yml: правило HttpFlood ==="
+cat > /etc/prometheus/alert.rules.yml <<'EOF'
+groups:
+- name: flood
+  rules:
+  - alert: HttpFlood
+    expr: increase(nginx_http_requests_total[10s]) > 200
+    labels:
+      severity: critical
+    annotations:
+      summary: "High HTTP request rate detected"
+EOF
+chown prometheus:prometheus /etc/prometheus/alert.rules.yml
+
+echo "=== [3/3] Проверка и перезапуск ==="
+/usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+/usr/local/bin/promtool check rules /etc/prometheus/alert.rules.yml
+systemctl restart prometheus
+sleep 2
+systemctl status prometheus --no-pager | head -n 10
+curl -s http://127.0.0.1:9090/-/healthy
+echo
+echo "Готово. Проверьте http://127.0.0.25:9090/alerts - правило HttpFlood должно быть Inactive."
+EOF_S2
+bash /root/pz4_stage2.sh
+```
+
+---
+
+## Ручной блок C: демонстрация срабатывания и оповещения
+
+1. Откройте **http://127.0.0.25:9090/alerts** — увидите правило `HttpFlood`, состояние **Inactive**.
+2. Создайте нагрузку, чтобы искусственно превысить порог `200` запросов за 10 секунд. Проще всего — быстрый curl-цикл прямо с сервера:
+   ```bash
+   for i in $(seq 1 500); do curl -sk -o /dev/null https://localhost & done; wait
+   ```
+   Или повторите атаку Rapid Reset из ПЗ3 с `gg Ubuntu`.
+3. В течение ~10–15 секунд обновляйте **http://127.0.0.25:9090/alerts** — правило перейдёт **Pending → Firing** (как на рис. 4.11).
+4. Откройте **http://127.0.0.25:9093/#/alerts** — там появится тот же алерт с меткой `alertname="HttpFlood"` (рис. 4.10).
+5. В Telegram-группе должно прийти сообщение о срабатывании (а через некоторое время после прекращения нагрузки — `Alerts Resolved`, как на рис. 4.12).
+
+Если сообщение не пришло при наличии алерта в Prometheus — смотрите логи:
+```bash
+journalctl -u alertmanager -n 30 --no-pager
+```
+
+---
+
+## Скрипт 3: установка и настройка Zeek
+
+Узнайте сначала реальное имя интерфейса:
+```bash
+IFACE=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
+echo "Интерфейс: $IFACE"
+```
+
+```bash
+cat > /root/pz4_stage3.sh <<'EOF_S3'
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+IFACE=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
+echo ">>> Используем интерфейс: $IFACE"
+
+echo "=== [1/8] Репозиторий Zeek ==="
+echo 'deb http://download.opensuse.org/repositories/security:/zeek/xUbuntu_24.04/ /' | tee /etc/apt/sources.list.d/security:zeek.list
+curl -fsSL https://download.opensuse.org/repositories/security:zeek/xUbuntu_24.04/Release.key | gpg --dearmor | tee /etc/apt/trusted.gpg.d/security_zeek.gpg > /dev/null
+apt-get update
+
+echo "=== [2/8] Установка Zeek ==="
+apt-get install -y zeek-6.0 || apt-get install -y zeek
+
+echo "=== [3/8] PATH ==="
+export PATH=/opt/zeek/bin:$PATH
+export PREF=/opt/zeek
+export BROKER_METRICS_PORT=4242
+grep -q "PATH=/opt/zeek/bin" /root/.bashrc 2>/dev/null || \
+  echo 'export PATH=/opt/zeek/bin:$PATH PREF=/opt/zeek BROKER_METRICS_PORT=4242' >> /root/.bashrc
+
+echo "=== [4/8] node.cfg ==="
+mkdir -p /opt/zeek/etc
+cat > /opt/zeek/etc/node.cfg <<EOF
+[zeek]
+type=standalone
+host=localhost
+interface=${IFACE}
+EOF
+
+echo "=== [5/8] zkg пакеты ==="
+/opt/zeek/bin/zkg autoconfig 2>/dev/null || true
+yes | /opt/zeek/bin/zkg install ncsa/bro-simple-scan zeek-notice-telegram || \
+  /opt/zeek/bin/zkg install --force ncsa/bro-simple-scan zeek-notice-telegram
+
+echo "=== [6/8] local.zeek и фикс main.zeek ==="
+echo "@load packages" >> /opt/zeek/share/zeek/site/local.zeek
+sed -i "s|\&default=0/unknown|\&default=1234/tcp|" /opt/zeek/share/zeek/base/frameworks/cluster/main.zeek || true
+
+echo "=== [7/8] zeekctl install ==="
+/opt/zeek/bin/zeekctl install
+
+echo "=== [8/8] systemd service ==="
+cat > /etc/systemd/system/zeek.service <<'EOF'
+[Unit]
+Description=zeek network analysis engine
+
+[Service]
+Type=forking
+PIDFile=/opt/zeek/spool/zeek/.pid
+Environment="BROKER_METRICS_PORT=4242"
+ExecStart=/opt/zeek/bin/zeekctl start
+ExecStop=/opt/zeek/bin/zeekctl stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable zeek
+systemctl start zeek
+sleep 3
+
+echo "=== ПРОВЕРКА ==="
+systemctl status zeek --no-pager | head -n 10
+curl -s http://127.0.0.1:4242/metrics | grep zeek_active_sessions
+EOF_S3
+bash /root/pz4_stage3.sh
+```
+
+**Отличия от методички:**
+- Репозиторий указан для `xUbuntu_24.04`, а не `22.04`, потому что ваша ВМ — Ubuntu 24.04 (как указано в ПЗ1). Если apt всё равно ругается на зависимости, проверьте точную версию `lsb_release -a` и при необходимости замените `24.04` на вашу.
+- Команда `zkg install` может потребовать интерактивного подтверждения — добавлен `yes |` для автоматического согласия.
+- Если `apt-get install -y zeek-6.0` не находит пакет с таким именем версии, скрипт пробует просто `zeek`.
+
+Добавьте проброс порта метрик Zeek, если хотите смотреть `/metrics` с хоста:
+
+| Name | Protocol | Host IP | Host Port | Guest IP | Guest Port |
+|---|---|---|---|---|---|
+| zeek-metrics | TCP | 127.0.0.25 | 4242 | 192.168.25.250 | 4242 |
+
+Проверка в браузере: **http://127.0.0.25:4242/metrics** (рис. 4.16).
+
+---
+
+## Скрипт 4: добавление Zeek в Prometheus + правила UDP/TCP flood
+
+```bash
+cat > /root/pz4_stage4.sh <<'EOF_S4'
+#!/bin/bash
+set -e
+
+echo "=== [1/3] Добавляем job zeek в prometheus.yml ==="
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+  scrape_timeout: 1s
+  external_labels:
+    monitor: 'gg-project'
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['localhost:9093']
+rule_files:
+  - alert.rules.yml
+
+scrape_configs:
+  - job_name: "nginx"
+    static_configs:
+      - targets: ["127.0.0.1:9114"]
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+  - job_name: "zeek"
+    metrics_path: "/metrics"
+    scheme: http
+    static_configs:
+      - targets: ["127.0.0.1:4242"]
+EOF
+chown prometheus:prometheus /etc/prometheus/prometheus.yml
+
+echo "=== [2/3] Правила HTTP + UDP + TCP flood ==="
+cat > /etc/prometheus/alert.rules.yml <<'EOF'
+groups:
+- name: HTTPflood
+  rules:
+  - alert: HttpFlood
+    expr: increase(nginx_http_requests_total[10s]) > 200
+    labels:
+      severity: critical
+    annotations:
+      summary: "High HTTP request rate detected"
+- name: UDPflood
+  rules:
+  - alert: UdpFlood
+    expr: irate(zeek_active_sessions{protocol="udp"}[10s]) > 7000
+    labels:
+      severity: critical
+    annotations:
+      summary: "High UDP request rate detected"
+- name: TCPflood
+  rules:
+  - alert: TcpFlood
+    expr: irate(zeek_active_sessions{protocol="tcp"}[10s]) > 7000
+    labels:
+      severity: critical
+    annotations:
+      summary: "High TCP request rate detected"
+EOF
+chown prometheus:prometheus /etc/prometheus/alert.rules.yml
+
+echo "=== [3/3] Проверка и перезапуск ==="
+/usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+/usr/local/bin/promtool check rules /etc/prometheus/alert.rules.yml
+systemctl restart prometheus
+sleep 2
+curl -s http://127.0.0.1:9090/api/v1/targets | grep -o '"job":"[a-z]*"'
+echo "Готово. http://127.0.0.25:9090/alerts должен показать 3 правила: HttpFlood, UdpFlood, TcpFlood."
+EOF_S4
+bash /root/pz4_stage4.sh
+```
+
+Пороги `7000` взяты из методички (рис. 4.18) как есть. На вашей виртуалке реальные значения `zeek_active_sessions` могут не достигать этого порога даже во время атаки — тогда уменьшите порог, например до `50` или `100`, чтобы увидеть срабатывание:
+```bash
+sed -i 's/> 7000/> 50/g' /etc/prometheus/alert.rules.yml
+systemctl restart prometheus
+```
+В отчёте опишите, что порог был скорректирован под реальную нагрузку вашего стенда — это нормально и ожидаемо для учебного окружения.
+
+---
+
+## Ручной блок D: атаки hping3 (с `gg Ubuntu`)
+
+Установите hping3 на атакующей ВМ:
+```bash
+sudo apt-get update
+sudo apt-get install -y hping3 nmap
+```
+
+### 1. Разведка портов (опционально, для отчёта)
+```bash
+nmap -p 1-1000 192.168.25.250
+```
+
+### 2. UDP flood
+```bash
+sudo hping3 -2 --flood -p 80 192.168.25.250
+```
+Остановите через 15–20 секунд **Ctrl+C**. Не держите флуд дольше — это нагружает весь стенд, включая роутер.
+
+### 3. TCP SYN flood
+```bash
+sudo hping3 --syn --flood -p 443 192.168.25.250 -c 5000
+```
+Остановите аналогично (`Ctrl+C` или дождитесь `-c`).
+
+### 4. Наблюдение результата
+
+Сразу после (или во время) атаки на хосте откройте:
+- **http://127.0.0.25:9090/graph** → запрос `irate(zeek_active_sessions{protocol="udp"}[10s])` и `irate(zeek_active_sessions{protocol="tcp"}[10s])` → вкладка Graph. Должен быть пик, аналогичный рис. 4.19.
+- **http://127.0.0.25:9090/alerts** → `UdpFlood`/`TcpFlood` должны перейти в Firing.
+- **http://127.0.0.25:9093/#/alerts** → та же пара алертов.
+- Telegram-группа → сообщения о срабатывании и (после остановки атаки и `resolve_timeout`) о разрешении.
+
+Не забудьте сделать те же скриншоты и для HTTP flood (можно повторить атаку Rapid Reset из ПЗ3, либо простой curl-цикл из ручного блока C).
+
+---
+
+## Команды диагностики (для отчёта и вопросов преподавателя)
+
+```bash
+############ 1. Alertmanager ############
+systemctl status alertmanager --no-pager
+systemctl is-active alertmanager
+systemctl is-enabled alertmanager
+cat /etc/alertmanager/alertmanager.yml       # проверьте, что chat_id реальный, не плейсхолдер
+cat /etc/systemd/system/alertmanager.service
+curl -s http://127.0.0.1:9093/-/healthy
+curl -s http://127.0.0.1:9093/-/ready
+curl -s http://127.0.0.1:9093/api/v2/alerts | python3 -m json.tool   # текущие активные алерты
+amtool alert --alertmanager.url=http://127.0.0.1:9093
+
+############ 2. Prometheus + правила ############
+systemctl status prometheus --no-pager
+cat /etc/prometheus/prometheus.yml
+cat /etc/prometheus/alert.rules.yml
+/usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+/usr/local/bin/promtool check rules /etc/prometheus/alert.rules.yml
+curl -s http://127.0.0.1:9090/api/v1/rules | python3 -m json.tool | grep -E 'name|state|health'
+curl -s http://127.0.0.1:9090/api/v1/alerts | python3 -m json.tool
+curl -s http://127.0.0.1:9090/api/v1/targets | python3 -m json.tool | grep -E 'job|health'
+
+############ 3. Zeek ############
+systemctl status zeek --no-pager
+systemctl is-active zeek
+/opt/zeek/bin/zeekctl status
+curl -s http://127.0.0.1:4242/metrics | grep zeek_active_sessions
+cat /opt/zeek/etc/node.cfg
+/opt/zeek/bin/zkg list                        # установленные пакеты (bro-simple-scan, notice-telegram)
+tail -n 30 /opt/zeek/logs/current/notice.log 2>/dev/null   # Zeek-уведомления о сканировании/аномалиях
+tail -n 30 /opt/zeek/logs/current/conn.log 2>/dev/null
+
+############ 4. Telegram-бот ############
+curl -s "https://api.telegram.org/bot<ТОКЕН>/getMe"            # информация о боте
+curl -s "https://api.telegram.org/bot<ТОКЕН>/getUpdates"       # последние события/chat_id
+
+############ 5. Проверка портов ############
+sudo ss -tlpn | grep -E ':9090|:9093|:9114|:4242'
+
+############ 6. Логи ############
+journalctl -u alertmanager -n 30 --no-pager
+journalctl -u prometheus -n 30 --no-pager
+journalctl -u zeek -n 30 --no-pager
+
+############ 7. Состояние сервера во время/после атак ############
+top -bn1 | head -15
+uptime
+sudo ss -s                                    # сводная статистика TCP/UDP-сокетов
+```
+
+### На атакующей ВМ
+```bash
+hping3 --version
+which nmap hping3
+```
+
+---
+
+## Чек-лист скриншотов для отчёта
+
+1. Параметры Telegram-бота (`getMe`/`getUpdates`) с токеном и chat_id (как рис. 4.2, можно замазать чувствительные части).
+2. `systemctl status alertmanager` — active (running); содержимое `alertmanager.yml` и `alertmanager.service` (токен частично скрыт).
+3. Страница `http://127.0.0.25:9093/#/alerts` — пустая/с алертами.
+4. `prometheus.yml` с разделами `alerting` и `rule_files`, содержимое `alert.rules.yml` (3 группы правил).
+5. Firing-алерт `HttpFlood` в Prometheus (`/alerts`) и в Alertmanager, сообщение в Telegram (Firing + Resolved).
+6. `systemctl status zeek` — active; вывод `curl http://127.0.0.1:4242/metrics` с `zeek_active_sessions`.
+7. Вывод hping3 на атакующей ВМ (UDP flood и SYN flood).
+8. Графики `irate(zeek_active_sessions{protocol="udp"}[10s])` и `...tcp...` с пиком во время атаки.
+9. Firing-алерты `UdpFlood`/`TcpFlood` в Prometheus и Alertmanager, соответствующие сообщения в Telegram.
+
+Если какой-то шаг упадёт — особенно `zkg install` (иногда ломается на новых версиях Ubuntu/Zeek) или репозиторий `opensuse.org` недоступен из вашей сети — пришлите вывод последних 20–30 строк, разберём по месту.
