@@ -87,5 +87,4 @@ systemctl status mysql --no-pager | head -n 8
 systemctl status php${PHPV}-fpm --no-pager | head -n 8
 curl -sI http://localhost | head -n 5
 echo "ГОТОВО. Теперь откройте в браузере хоста http://127.0.0.25"
-EOF_S2
-bash /root/pz2_stage2.sh
+
